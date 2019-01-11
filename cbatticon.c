@@ -52,13 +52,12 @@ static gboolean get_battery_present (gchar *path, gboolean *present);
 
 static gboolean get_battery_status (gint *status);
 
-static gboolean get_battery_full_capacity (gboolean *use_charge, gdouble *capacity);
-static gboolean get_battery_remaining_capacity (gboolean use_charge, gdouble *capacity);
-static gboolean get_battery_current_rate (gboolean use_charge, gdouble *rate);
+static gboolean get_battery_full_capacity (gdouble *capacity);
+static gboolean get_battery_remaining_capacity (gdouble *capacity);
+static gboolean get_battery_current_rate (gdouble *rate);
+static gboolean get_battery_time (gboolean remaining, gdouble *timesec);
 
 static gboolean get_battery_charge (gboolean remaining, gint *percentage, gint *time);
-static gboolean get_battery_time_estimation (gdouble remaining_capacity, gdouble y, gint *time);
-static void reset_battery_time_estimation (void);
 
 static void create_tray_icon (void);
 static gboolean update_tray_icon (GtkStatusIcon *tray_icon);
@@ -136,16 +135,6 @@ struct configuration {
 static gchar *battery_suffix = NULL;
 static gchar *battery_path   = NULL;
 static gchar *ac_path        = NULL;
-
-/*
- * workaround for limited/bugged batteries/drivers that don't provide current rate
- * the next 4 variables are used to calculate estimated time
- */
-
-static gboolean estimation_needed             = FALSE;
-static gdouble  estimation_remaining_capacity = -1;
-static gint     estimation_time               = -1;
-static GTimer  *estimation_timer              = NULL;
 
 /*
  * command line options function
@@ -336,15 +325,6 @@ static void get_power_supplies (void)
     g_free (battery_path); battery_path = NULL;
     g_free (ac_path); ac_path = NULL;
 
-    estimation_needed             = FALSE;
-    estimation_remaining_capacity = -1;
-    estimation_time               = -1;
-    if (estimation_timer != NULL) {
-        g_timer_stop (estimation_timer);
-        g_timer_destroy (estimation_timer);
-        estimation_timer = NULL;
-    }
-
     /* retrieve power supplies information */
 
     directory = g_dir_open (SYSFS_PATH, 0, &error);
@@ -372,16 +352,6 @@ static void get_power_supplies (void)
 
                             /* workaround for limited/bugged batteries/drivers */
                             /* that don't provide current rate                 */
-
-                            if (get_battery_current_rate (FALSE, NULL) == FALSE &&
-                                get_battery_current_rate (TRUE, NULL) == FALSE) {
-                                estimation_needed = TRUE;
-                                estimation_timer = g_timer_new ();
-
-                                if (configuration.debug_output == TRUE) {
-                                    g_printf ("workaround: current rate is not available, estimating rate\n");
-                                }
-                            }
 
                             if (configuration.debug_output == TRUE) {
                                 g_printf ("battery path: %s\n", battery_path);
@@ -561,43 +531,38 @@ static gboolean get_battery_status (gint *status)
     return sysattr_status;
 }
 
-static gboolean get_battery_full_capacity (gboolean *use_charge, gdouble *capacity)
+static gboolean get_battery_full_capacity (gdouble *capacity)
 {
     gboolean sysattr_status;
 
-    g_return_val_if_fail (use_charge != NULL, FALSE);
     g_return_val_if_fail (capacity != NULL, FALSE);
 
-    sysattr_status = get_sysattr_double (battery_path, "energy_full", capacity);
-    *use_charge = FALSE;
-
-    if (sysattr_status == FALSE) {
-        sysattr_status = get_sysattr_double (battery_path, "charge_full", capacity);
-        *use_charge = TRUE;
-    }
+    sysattr_status = get_sysattr_double (battery_path, "charge_full", capacity);
 
     return sysattr_status;
 }
 
-static gboolean get_battery_remaining_capacity (gboolean use_charge, gdouble *capacity)
+static gboolean get_battery_remaining_capacity (gdouble *capacity)
 {
     g_return_val_if_fail (capacity != NULL, FALSE);
 
-    if (use_charge == FALSE) {
-        return get_sysattr_double (battery_path, "energy_now", capacity);
-    } else {
         return get_sysattr_double (battery_path, "charge_now", capacity);
+}
+
+static gboolean get_battery_current_rate (gdouble *rate)
+{
+        return get_sysattr_double (battery_path, "current_now", rate);
+}
+
+static gboolean get_battery_time (gboolean remaining, gdouble *timesec)
+{
+    if (remaining) {
+        return get_sysattr_double (battery_path, "time_to_empty_avg", timesec);
+    } else {
+        return get_sysattr_double (battery_path, "time_to_full_avg", timesec);
     }
 }
 
-static gboolean get_battery_current_rate (gboolean use_charge, gdouble *rate)
-{
-    if (use_charge == FALSE) {
-        return get_sysattr_double (battery_path, "power_now", rate);
-    } else {
-        return get_sysattr_double (battery_path, "current_now", rate);
-    }
-}
 
 /*
  * computation functions
@@ -605,12 +570,11 @@ static gboolean get_battery_current_rate (gboolean use_charge, gdouble *rate)
 
 static gboolean get_battery_charge (gboolean remaining, gint *percentage, gint *time)
 {
-    gdouble full_capacity, remaining_capacity, current_rate;
-    gboolean use_charge;
+    gdouble full_capacity, remaining_capacity, current_rate, timesec;
 
     g_return_val_if_fail (percentage != NULL, FALSE);
 
-    if (get_battery_full_capacity (&use_charge, &full_capacity) == FALSE) {
+    if (get_battery_full_capacity (&full_capacity) == FALSE) {
         if (configuration.debug_output == TRUE) {
             g_printf ("full capacity: %s\n", "unavailable");
         }
@@ -618,7 +582,7 @@ static gboolean get_battery_charge (gboolean remaining, gint *percentage, gint *
         return FALSE;
     }
 
-    if (get_battery_remaining_capacity (use_charge, &remaining_capacity) == FALSE) {
+    if (get_battery_remaining_capacity (&remaining_capacity) == FALSE) {
         if (configuration.debug_output == TRUE) {
             g_printf ("remaining capacity: %s\n", "unavailable");
         }
@@ -632,15 +596,12 @@ static gboolean get_battery_charge (gboolean remaining, gint *percentage, gint *
         return TRUE;
     }
 
-    if (estimation_needed == TRUE) {
-        if (remaining == TRUE) {
-            return get_battery_time_estimation (remaining_capacity, 0, time);
-        } else {
-            return get_battery_time_estimation (remaining_capacity, full_capacity, time);
-        }
+    if (get_battery_time(remaining, &timesec) == TRUE) {
+        *time = (gint)(timesec / 60.0);
+        return TRUE;
     }
 
-    if (get_battery_current_rate (use_charge, &current_rate) == FALSE) {
+    if (get_battery_current_rate (&current_rate) == FALSE) {
         if (configuration.debug_output == TRUE) {
             g_printf ("current rate: %s\n", "unavailable");
         }
@@ -655,41 +616,6 @@ static gboolean get_battery_charge (gboolean remaining, gint *percentage, gint *
     }
 
     return TRUE;
-}
-
-static gboolean get_battery_time_estimation (gdouble remaining_capacity, gdouble y, gint *time)
-{
-    if (estimation_remaining_capacity == -1) {
-        estimation_remaining_capacity = remaining_capacity;
-    }
-
-    /*
-     * y = mx + b ... x = (y - b) / m
-     * solving for when y = 0 (discharging) or full_capacity (charging)
-     */
-
-    if (remaining_capacity != estimation_remaining_capacity) {
-        gdouble estimation_elapsed = g_timer_elapsed (estimation_timer, NULL);
-        gdouble estimation_current_rate = (remaining_capacity - estimation_remaining_capacity) / estimation_elapsed;
-        gdouble estimation_seconds = (y - remaining_capacity) / estimation_current_rate;
-
-        *time = (gint)(estimation_seconds / 60.0);
-
-        estimation_remaining_capacity = remaining_capacity;
-        estimation_time               = *time;
-        g_timer_start (estimation_timer);
-    } else {
-        *time = estimation_time;
-    }
-
-    return TRUE;
-}
-
-static void reset_battery_time_estimation (void)
-{
-    estimation_remaining_capacity = -1;
-    estimation_time               = -1;
-    g_timer_start (estimation_timer);
 }
 
 /*
@@ -831,10 +757,6 @@ static void update_tray_icon_status (GtkStatusIcon *tray_icon)
             break;
 
         case CHARGING:
-            if (old_battery_status != CHARGING && estimation_needed == TRUE) {
-                reset_battery_time_estimation ();
-            }
-
             if (get_battery_charge (FALSE, &percentage, &time) == FALSE) {
                 return;
             }
@@ -844,10 +766,6 @@ static void update_tray_icon_status (GtkStatusIcon *tray_icon)
 
         case DISCHARGING:
         case NOT_CHARGING:
-            if (old_battery_status != DISCHARGING && estimation_needed == TRUE) {
-                reset_battery_time_estimation ();
-            }
-
             if (get_battery_charge (TRUE, &percentage, &time) == FALSE) {
                 return;
             }
